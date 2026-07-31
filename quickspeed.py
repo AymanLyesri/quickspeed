@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import datetime
 import io
+import math
 import os
 import socket
-import subprocess
 import time
 import urllib.request
 
@@ -34,45 +34,96 @@ def speed_str(bytes_per_sec):
     return f"{mbytes_per_sec:.2f} MB/s ({mbits_per_sec:.2f} Mbps)"
 
 
-def get_default_gateway():
-    try:
-        result = subprocess.run(
-            ["ip", "route"], capture_output=True, text=True, check=True
+# ==========================================
+# Analog gauge rendering
+# ==========================================
+
+_gauge_lines_printed = 0  # tracks how many lines the gauge occupies, for in-place redraw
+
+
+def _render_gauge(percent, value_str, label, width=43):
+    """
+    Builds a semicircular analog speedometer (dial + sweeping needle) as a
+    list of text lines. The needle sweeps from 180 deg (0%, left) to
+    0 deg (100%, right), like a real speedometer.
+    """
+    radius = width // 2
+    arc_height = radius // 2 + 2  # rows used by the arc + needle + pivot
+    height = arc_height + 1  # +1 dedicated row for tick labels
+
+    grid = [[" " for _ in range(width)] for _ in range(height)]
+    baseline = arc_height - 1
+
+    # Arc track
+    for deg in range(0, 181, 2):
+        rad = math.radians(deg)
+        x = int(round(radius + radius * math.cos(rad)))
+        y = int(round(baseline - (radius / 2) * math.sin(rad)))
+        if 0 <= y < arc_height and 0 <= x < width:
+            grid[y][x] = "·"
+
+    # Tick labels (0 / 25 / 50 / 75 / 100), safely clamped inside the width
+    for pct, ch in [(0, "0"), (25, "25"), (50, "50"), (75, "75"), (100, "100")]:
+        deg = 180 - (pct / 100) * 180
+        rad = math.radians(deg)
+        x = int(round(radius + (radius + 1) * math.cos(rad)))
+        start = x - (len(ch) // 2)
+        start = max(0, min(width - len(ch), start))
+        for i, c in enumerate(ch):
+            grid[baseline + 1][start + i] = c
+
+    # Needle
+    pct = max(0, min(percent, 100))
+    needle_deg = 180 - (pct / 100) * 180
+    rad = math.radians(needle_deg)
+    needle_len = radius - 2
+    needle_color = GREEN if percent >= 100 else YELLOW
+    for r in range(needle_len):
+        x = int(round(radius + r * math.cos(rad)))
+        y = int(round(baseline - (r / 2) * math.sin(rad)))
+        if 0 <= y < arc_height and 0 <= x < width:
+            grid[y][x] = "#"
+
+    grid[baseline][radius] = "●"
+
+    raw_lines = ["".join(row) for row in grid]
+    # Colorize just the needle/pivot characters
+    colored_lines = []
+    for line in raw_lines:
+        line = line.replace("#", f"{needle_color}#{NC}").replace(
+            "●", f"{needle_color}●{NC}"
         )
-        for line in result.stdout.splitlines():
-            if line.startswith("default"):
-                parts = line.split()
-                if "via" in parts:
-                    return parts[parts.index("via") + 1]
-    except Exception:
-        return None
-    return None
+        colored_lines.append(line)
+
+    title = f" {BOLD}{label}{NC} ".center(width + len(BOLD) + len(NC), "─")
+    readout = f"{BOLD}{value_str}{NC}".center(width + len(BOLD) + len(NC))
+    return [title] + colored_lines + [readout]
 
 
 def show_progress(current_bytes, total_bytes, start_time, prefix="Progress"):
-    """Renders a dynamic live-updating progress bar with true speed metrics."""
+    """Renders a dynamic live-updating ANALOG gauge with true speed metrics."""
+    global _gauge_lines_printed
+
     elapsed = time.perf_counter() - start_time
     bytes_per_sec = current_bytes / elapsed if elapsed > 0 else 0
     percent = (current_bytes / total_bytes) * 100 if total_bytes > 0 else 0
-
-    # Progress bar layout
-    bar_length = 20
-    filled_length = (
-        int(bar_length * current_bytes // total_bytes) if total_bytes > 0 else 0
-    )
-    bar = "█" * filled_length + "░" * (bar_length - filled_length)
-
-    color = GREEN if current_bytes >= total_bytes else YELLOW
     speed_display = (
         speed_str(bytes_per_sec) if current_bytes > 0 else "0.00 MB/s (0.00 Mbps)"
     )
 
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(
-        f"\r[{timestamp}] {prefix:<18}: {color}|{bar}| {percent:3.0f}% ({speed_display}){NC}",
-        end="",
-        flush=True,
-    )
+    lines = _render_gauge(percent, f"{percent:5.1f}%  |  {speed_display}", prefix)
+
+    # Move cursor back up over the previously printed gauge and clear each line
+    if _gauge_lines_printed:
+        print(f"\033[{_gauge_lines_printed}A", end="")
+    for line in lines:
+        print(f"\033[K{line}")
+    _gauge_lines_printed = len(lines)
+
+
+def _reset_gauge_tracking():
+    global _gauge_lines_printed
+    _gauge_lines_printed = 0
 
 
 class ProgressUploadWrapper:
@@ -103,7 +154,7 @@ class ProgressUploadWrapper:
 
 
 # Clear terminal and print header
-subprocess.run("clear")
+os.system("cls" if os.name == "nt" else "clear")
 
 # Credits:
 print(f"{BOLD}Quickspeed - Ayman Lyesri (Timed Modification){NC}")
@@ -115,27 +166,20 @@ sp_ul = 0
 # ==========================================
 # 1. Network Baselines
 # ==========================================
-gateway = get_default_gateway()
 
-if gateway:
-    ping_res = subprocess.run(
-        ["ping", "-c", "1", "-W", "1", gateway],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if ping_res.returncode == 0:
-        log(f"Gateway ({gateway}): {GREEN}OK{NC}")
-    else:
-        log(f"Gateway ({gateway}): {RED}FAILED{NC}")
+
+def check_connectivity(host=TARGET, port=443, timeout=2):
+    try:
+        with socket.create_connection((host, port), timeout):
+            return True
+    except OSError:
+        return False
+
+
+if check_connectivity():
+    log(f"Network Connectivity: {GREEN}OK{NC}")
 else:
-    log(f"Gateway: {RED}NOT FOUND{NC}")
-
-try:
-    socket.gethostbyname(TARGET)
-    log(f"DNS Resolution: {GREEN}OK{NC}")
-except socket.gaierror:
-    log(f"DNS Resolution: {RED}FAILED{NC}")
-
+    log(f"Network Connectivity: {RED}FAILED{NC}")
 
 # ==========================================
 # 2. Speed Test via Cloudflare Edge
@@ -151,6 +195,7 @@ try:
     raw_data = bytearray()
     chunk_size = 32 * 1024  # 32 KB chunks
 
+    _reset_gauge_tracking()
     start_time = time.perf_counter()
     with urllib.request.urlopen(req_dl) as response:
         while True:
@@ -170,7 +215,7 @@ try:
     duration_dl = end_time - start_time
     sp_dl = len(raw_data) / duration_dl if duration_dl > 0 else 0
 
-    # Redraw progress bar to perfectly match final chunk length read
+    # Redraw gauge to perfectly match final chunk length read
     show_progress(len(raw_data), total_dl_bytes, start_time, "Sustained Download")
     print()  # Move to next line
 
@@ -185,6 +230,7 @@ upload_raw_bytes = os.urandom(total_ul_bytes)
 
 try:
     bytes_stream = io.BytesIO(upload_raw_bytes)
+    _reset_gauge_tracking()
     start_time = time.perf_counter()
     progress_stream = ProgressUploadWrapper(
         bytes_stream, total_ul_bytes, start_time, "Sustained Upload"

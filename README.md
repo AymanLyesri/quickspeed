@@ -17,10 +17,18 @@ Unlike bloated speed test CLI tools, `quickspeed` requires absolutely no package
 
 ## 🚀 Quick Start (Run Instantly)
 
-You don't even need to clone the repo. Run it directly from your terminal using this single universal command:
+No installation or cloning required.
+
+### Linux / macOS (Bash or Zsh)
 
 ```bash
 python3 <(curl -fsSL https://raw.githubusercontent.com/AymanLyesri/quickspeed/refs/heads/master/quickspeed.py)
+```
+
+### Windows (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/AymanLyesri/quickspeed/refs/heads/master/quickspeed.py | python -
 ```
 
 ---
